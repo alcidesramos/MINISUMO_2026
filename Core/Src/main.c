@@ -92,15 +92,7 @@ char texto[500];
 uint16_t milimetros;
 uint16_t codigo;
 float voltaje;
-float distancia[8] = {0.0f};
-static const float alpha_lidar = 0.35f;
-
-// Compensacion de crosstalk optico por canal (0 = sin compensar).
-// Se llenan corriendo CALIBRATE_LIDARS_XTALK() una vez con un objetivo real
-// a distancia conocida delante de cada sensor, y luego se pueden copiar los
-// valores impresos por UART aqui como constantes para no tener que calibrar
-// en cada arranque.
-FixPoint1616_t lidar_xtalk[8] = {0,0,0,0,0,0,0,0};
+float distancia[LIDAR_N] = {0.0f};   // distancia en cm (lidar_max_mm/10 = sin objetivo)
 
 uint32_t TICK_RC;
 
@@ -268,12 +260,6 @@ void Manda_IMU()
 	 uartx_write_text(&huart1, texto);
 }
 
-#define  LIDAR_ADDR  0x70<<1
-void I2C_MUX(uint8_t channel)
-{
-    uint8_t mask = (1 << channel);
-    HAL_I2C_Master_Transmit(&hi2c2, LIDAR_ADDR, &mask, 1, 100);
-}
 void Manda_Lidars()
 {
 	   sprintf(texto,"Dis1=%.1f\r\n",distancia[0]);
@@ -294,88 +280,38 @@ void Manda_Lidars()
 		uartx_write_text(&huart1, texto);
 		uartx_write_text(&huart1,"\r\n");
 }
-void INIT_LIDARS()
-{
-	for (uint8_t canal = 0; canal < 8; canal++)
-	{
-	  I2C_MUX(canal);
-	  if (HAL_I2C_IsDeviceReady(&hi2c2, dir_s1 , 2, 200) == HAL_OK)
-	     {
-	       uartx_write_text(&huart1,texto);
-	     	lidar_init(dir_s1);
-	     }
-
-	}
-	 }
 void INIT_LIDARS_FAST()
 {
-	for (uint8_t canal = 0; canal < 8; canal++)
-		{
-		  I2C_MUX(canal);
-		  if (HAL_I2C_IsDeviceReady(&hi2c2, dir_s1 , 2, 200) == HAL_OK)
-		     {
-			uartx_write_text(&huart1,texto);
-			lidar_init_fast(dir_s1);
-		   }
-
-		}
+	uint8_t mascara = lidar_init_todos();
+	sprintf(texto,"LIDARS OK mask=0x%02X\r\n",mascara);   // bit n = sensor del canal n
+	uartx_write_text(&huart1, texto);
 }
 
+// Envia los 8 lidars en un solo frame por interrupcion (no bloquea).
+// Si el frame anterior aun se esta enviando, este se salta.
+// Ojo: mientras transmite, un uartx_write_text bloqueante recibe HAL_BUSY.
 void Manda_Lidars_Teleplot()
 {
-	sprintf(texto,">L1:%.1f\n",distancia[0]);
-    uartx_write_text(&huart1, texto);
-	sprintf(texto,">L2:%.1f\n",distancia[1]);
-    uartx_write_text(&huart1, texto);
-	sprintf(texto,">L3:%.1f\n",distancia[2]);
-    uartx_write_text(&huart1, texto);
-	sprintf(texto,">L4:%.1f\n",distancia[3]);
-    uartx_write_text(&huart1, texto);
-	sprintf(texto,">L5:%.1f\n",distancia[4]);
-    uartx_write_text(&huart1, texto);
-	sprintf(texto,">L6:%.1f\n",distancia[5]);
-    uartx_write_text(&huart1, texto);
-	sprintf(texto,">L7:%.1f\n",distancia[6]);
-    uartx_write_text(&huart1, texto);
-	sprintf(texto,">L8:%.1f\n",distancia[7]);
-    uartx_write_text(&huart1, texto);
+	static char tx_lidar[LIDAR_N * 16];
+	int n = 0;
 
+	if (huart1.gState != HAL_UART_STATE_READY) return;
+
+	for (uint8_t c = 0; c < LIDAR_N; c++)
+		n += snprintf(&tx_lidar[n], sizeof(tx_lidar) - n, ">L%u:%.1f\n", c + 1, distancia[c]);
+
+	HAL_UART_Transmit_IT(&huart1, (uint8_t *)tx_lidar, n);
 }
 
-
-void LEE_LIDARS()
+// Barrido rapido sin retardos: los sensores miden solos en modo continuo.
+// Retorna cuantos sensores entregaron dato nuevo.
+uint8_t LEE_LIDARS_FAST()
 {
+	uint8_t nuevos = lidar_actualiza();
 
-	for (uint8_t canal = 0; canal < 8; canal++)
-	{
-	    I2C_MUX(canal);  // activa el canal correspondiente (0–7)
-	    if (HAL_I2C_IsDeviceReady(&hi2c2, dir_s1 , 2, 100) == HAL_OK)
-	   {distancia[canal]=lidar_lee_cm(dir_s1);}
-     HAL_Delay(5);  //pequeño retardo para que el sensor se estabilice
-	   }
-}
-
-void LEE_LIDARS_FAST()
-{
-
-  for (uint8_t canal = 0; canal < 8; canal++)
-    {
-        I2C_MUX(canal);  // activa el canal correspondiente (0–7)
-        if (HAL_I2C_IsDeviceReady(&hi2c2, dir_s1 , 1, 200) == HAL_OK)
-        {
-        	int16_t lectura_mm = lidar_lee_mm_fast(dir_s1);
-        	if (lectura_mm >= 0)
-        	{
-        		float lectura_cm = (float)lectura_mm / 10.0f;
-        		if (distancia[canal] == 0.0f)
-        			distancia[canal] = lectura_cm;
-        		else
-        			distancia[canal] += alpha_lidar * (lectura_cm - distancia[canal]);
-        	}
-        }
-     HAL_Delay(15);  //pequeño retardo para que el sensor se estabilice
-
-     }
+	for (uint8_t c = 0; c < LIDAR_N; c++)
+		distancia[c] = lidar_cm(c);
+	return nuevos;
 }
 
 
@@ -388,7 +324,7 @@ void  VOIDTEST()
 	     LEE_RX();
 	    LEE_IMU();
 	  //  uartx_write_text(&huart1, "OPERANDO\r\n");
-	  LEE_LIDARS_FAST();
+	  LEE_LIDARS_FAST();   // barrido de los 8 lidars, debe quedar en pocos ms
 }
 
 void test_muestreo()
@@ -544,16 +480,34 @@ Sensores_init();//inia adc DMA
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
 
+  uint32_t tick_teleplot = uwTick;
+
   while (1)
   {
-  //  LEE_LIDARS();
+   sprintf(texto,">BAT:%u\n",adc1_codigo[0]);
+    uartx_write_text(&huart1, texto);
+   sprintf(texto,">S1:%u\n",adc1_codigo[1]);
+    uartx_write_text(&huart1, texto);
+   sprintf(texto,">S2:%u\n",adc1_codigo[2]);
+    uartx_write_text(&huart1, texto);
+   sprintf(texto,">S3:%u\n",adc1_codigo[3]);
+    uartx_write_text(&huart1, texto);
+   sprintf(texto,">S4:%u\n",adc1_codigo[4]);
+    uartx_write_text(&huart1, texto);
+    HAL_Delay(100);
     
-    LEE_LIDARS_FAST();
 
-     Manda_Lidars_Teleplot();
-  
-    HAL_GPIO_TogglePin(LED1_GPIO_Port, LED1_Pin);
-    HAL_Delay(1);
+
+  }
+  while (1)
+  {
+    // Barrido sin esperas; se envia a Teleplot como maximo una vez por periodo de medida.
+    if (LEE_LIDARS_FAST() && ((uwTick - tick_teleplot) >= LIDAR_PERIODO_MS))
+    {
+      tick_teleplot = uwTick;
+      Manda_Lidars_Teleplot();
+      HAL_GPIO_TogglePin(LED1_GPIO_Port, LED1_Pin);
+    }
   }
  while (1)
  {
