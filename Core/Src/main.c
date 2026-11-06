@@ -32,6 +32,8 @@
 #include "PWM_IN.h"
 #include "UARTRX.h"
 #include "bno055.h"
+#include "ircodigo.h"
+#include "parametros.h"
 
 #include "lidarvl53.h"
 #include "IR_ANA_SEN.h"
@@ -75,6 +77,7 @@ TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim3;
 TIM_HandleTypeDef htim4;
 TIM_HandleTypeDef htim6;
+TIM_HandleTypeDef htim7;
 TIM_HandleTypeDef htim8;
 TIM_HandleTypeDef htim12;
 TIM_HandleTypeDef htim15;
@@ -84,7 +87,17 @@ DMA_HandleTypeDef handle_GPDMA1_Channel0;
 
 /* USER CODE BEGIN PV */
 extern uint16_t pulso1,pulso2,pulso3,pulso4;
-float ancho1=1500,ancho2=1500,ancho3=1500,ancho4=1500;
+float ancho1=0,ancho2=0,ancho3=0,ancho4=0;   //en us. 0 = sin señal del radio
+#define RC_MIN_US      800   //pulso valido del radio (TIM2 cuenta en us)
+#define RC_MAX_US      2200
+#define RC_TIMEOUT_MS  200   //sin pulsos validos este tiempo = señal perdida
+#define RC_PULSOS_OK   5     //pulsos validos seguidos para aceptar la señal (unos 100 ms a 50 Hz)
+#define RC_PERIODO_MAX_MS 60 //mas separados que esto no cuentan como seguidos
+#define RC3_BAJO       1300  //canal 3 por debajo = manda el radio (interruptor abajo = 970)
+#define RC3_ALTO       1700  //canal 3 por encima = para el radio y manda python (interruptor arriba = 2050). Entre los dos = transmisor apagado
+#define RC3_MEDIO_MS   300   //tiempo en el medio para darlo por apagado
+#define RC_ZONA_MUERTA 30    //us alrededor de 1500 que cuentan como mando centrado
+#define PRUEBA_SOLO_RADIO 1  //1 = prueba: canal 3 elige reposo o control, canales 1 y 2 a los motores. 0 = programa normal
 char texto[500];
 
 //variables lidar
@@ -96,14 +109,14 @@ float distancia[LIDAR_N] = {0.0f};   // distancia en cm (lidar_max_mm/10 = sin o
 
 uint32_t TICK_RC;
 
-float kgiro=0.6;
-int16_t vgiro=500;
+//kgiro y vgiro ahora estan en PARAM (parametros.h): se guardan en la flash
+uint8_t imu_ok=0;   //1 = el BNO055 respondio al arrancar
 
-enum estados{stop,run};
+enum estados{stop,run,test,automatico};   //MISMO orden que ESTADOS en minisumo_panel.py
 
 uint8_t estado=stop;
-uint8_t  flancoestado=stop;
-uint8_t  flancoestado_=stop;
+uint8_t  flancoestado=run;
+uint8_t  flancoestado_=run;   //al encender no arranca: hay que subir y bajar el canal 3 para mover
 
 
 
@@ -126,54 +139,97 @@ static void MX_TIM12_Init(void);
 static void MX_ICACHE_Init(void);
 static void MX_TIM15_Init(void);
 static void MX_TIM6_Init(void);
+static void MX_TIM7_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+typedef struct {
+    uint32_t tick_pulso;    //ultimo pulso con ancho valido
+    uint32_t tick_valido;   //ultimo pulso aceptado como señal
+    uint8_t  seguidos;      //pulsos validos seguidos
+} CANAL_RC;
+
+//lee un canal del radio. Un radio real manda pulsos validos sin parar; el ruido da pulsos
+//sueltos que pueden caer en el rango. Por eso solo se acepta tras RC_PULSOS_OK pulsos seguidos.
+//sin señal aceptada durante RC_TIMEOUT_MS: ancho=0 = señal perdida
+static void Lee_canal_RC(uint8_t *flag, uint16_t pulso, CANAL_RC *c, float *ancho)
+{
+     if (*flag==1)
+     {
+    	 if ((pulso>=RC_MIN_US)&&(pulso<=RC_MAX_US))
+    	 {
+    		 if ((uwTick-c->tick_pulso)>RC_PERIODO_MAX_MS) c->seguidos=0;   //muy separado del anterior
+    		 c->tick_pulso=uwTick;
+    		 if (c->seguidos<RC_PULSOS_OK) c->seguidos++;
+
+    		 if (c->seguidos>=RC_PULSOS_OK)
+    		 {
+    			 *ancho=pulso;
+    			 c->tick_valido=uwTick;
+    		 }
+    	 }
+    	 else c->seguidos=0;
+
+    	 *flag=0;
+     }
+
+     if ((uwTick-c->tick_valido)>RC_TIMEOUT_MS) *ancho=0;
+}
+
 void LEE_PWM()
 {
-     if (flag_PWM_in1==1)
+     static CANAL_RC rc1,rc2,rc3,rc4;
+     static uint8_t senal_ok=0;   //1 = llegan los canales 1, 2 y 3
+     static uint32_t tick_c3_fuera=0;   //ultima vez que el canal 3 NO estaba en el medio
+
+     //canales cruzados: ancho1 (velocidad) se lee de la entrada 2, ancho2 (giro) de la entrada 1
+     Lee_canal_RC(&flag_PWM_in2,pulso2,&rc1,&ancho1);
+     Lee_canal_RC(&flag_PWM_in1,pulso1,&rc2,&ancho2);
+     Lee_canal_RC(&flag_PWM_in3,pulso3,&rc3,&ancho3);
+     Lee_canal_RC(&flag_PWM_in4,pulso4,&rc4,&ancho4);
+
+     //transmisor apagado: el receptor sigue mandando cerca de 1500 en todos los canales.
+     //el canal 3 nunca se queda en el medio con el radio encendido: eso delata el apagado.
+     //se exige un tiempo minimo porque al mover el interruptor puede pasar un instante por el medio
+     uint8_t c3_medio=((ancho3>RC3_BAJO)&&(ancho3<RC3_ALTO)) ? 1 : 0;
+     if (!c3_medio) tick_c3_fuera=uwTick;
+
+     if ((ancho1==0)||(ancho2==0)||(ancho3==0)||((uwTick-tick_c3_fuera)>RC3_MEDIO_MS))
      {
-    	 if (pulso1<2500) ancho1=pulso1;
-	   flag_PWM_in1=0;
+    	 if (senal_ok==1)                //se acaba de perder: para el robot una sola vez
+    	 {                               //(asi no anula un RUN serial con el radio apagado)
+    		 estado=stop;
+    		 uartx_write_text(&huart1, "RADIO: apagado o sin senal\r\n");
+    	 }
+    	 senal_ok=0;
+    	 flancoestado=run;
+    	 flancoestado_=run;              //al volver no arranca: hay que subir y bajar el canal 3
      }
-     if (flag_PWM_in2==1)
-         {
-    	 if (pulso2<2500)  ancho2=pulso2;
-    	   flag_PWM_in2=0;
-         }
-
-     if (flag_PWM_in3==1)
-         {
-    	 if (pulso3<2500)  ancho3=pulso3;
-    	   flag_PWM_in1=0;
-         }
-
-     if (flag_PWM_in4==1)
-         {
-    	 if (pulso4<2500) ancho4=pulso4;
-    	   flag_PWM_in4=0;
-         }
-
-
-     if (ancho3>1000) flancoestado=run;
-     else flancoestado=stop;
-
-     if (flancoestado!=flancoestado_)
+     else
      {
-    	 if(flancoestado==run) estado=run;
-    	 else estado=stop;
+    	 senal_ok=1;
 
-    	 flancoestado_=flancoestado;
+    	 if (ancho3<=RC3_BAJO) flancoestado=run;          //abajo = manda el radio
+    	 else if (ancho3>=RC3_ALTO) flancoestado=stop;    //arriba = para el radio y manda python
+    	 //en el medio (un instante, moviendo el interruptor) conserva el valor anterior
+
+    	 if (flancoestado!=flancoestado_)
+    	 {
+    		 if(flancoestado==run)
+    		 {
+    			 estado=run;
+    			 //queda en TRAMA: si el robot se mueve solo, muestra si el firmware lo ordeno
+    			 sprintf(texto,"RADIO: arranca C1=%.0f C2=%.0f C3=%.0f\r\n",ancho1,ancho2,ancho3);
+    			 uartx_write_text(&huart1, texto);
+    		 }
+    		 else estado=stop;
+
+    		 flancoestado_=flancoestado;
+    	 }
      }
-
-     //Si se pierde la señal lo pone en 1500us
-     if (uwTick-TICK_PWM_IN1>200) ancho1=0;
-     if (uwTick-TICK_PWM_IN2>200) ancho2=0;
-     if (uwTick-TICK_PWM_IN3>200) ancho3=0;
-     if (uwTick-TICK_PWM_IN4>200) ancho4=0;
 
 
 
@@ -182,76 +238,289 @@ void LEE_PWM()
 	  uartx_write_text(&huart1, texto);
 
 	*/
-	   // teleplot
-	   sprintf(texto,">C1:%.1f\n",ancho1);
-	   uartx_write_text(&huart1, texto);
-	   sprintf(texto,">C2:%.1f\n",ancho2);
-	   	   uartx_write_text(&huart1, texto);
-		   sprintf(texto,">C3:%.1f\n",ancho3);
-		   	   uartx_write_text(&huart1, texto);
-			sprintf(texto,">C4:%.1f\n",ancho4);
-			   	   uartx_write_text(&huart1, texto);
+	// el envio de ancho1..4 (teleplot) ahora esta en Manda_basicos, 5 veces por segundo
+}
+
+//aplica velocidad y giro a los motores, en us respecto al neutro (-500 a +500).
+//giro se limita a vgiro y cada motor a vmax (tambien en los test); kgiro frena el motor que va mas rapido:
+//  kgiro<1 frena el izquierdo, kgiro>1 frena el derecho, 1 = sin correccion
+static void Motores_mueve(int16_t vel, int16_t giro)
+{
+    //limito velocidad giro
+    if (giro>PARAM.vgiro)  giro=PARAM.vgiro;
+    if (giro<-PARAM.vgiro) giro=-PARAM.vgiro;
+
+    // aplica giro
+    int16_t pwm_left  = 1500 + vel + giro;
+    int16_t pwm_right = 1500 + vel - giro;
+
+    // Limito cada motor a 1500 +- vmax (vmax=500: 1000-2000)
+    int16_t pwm_min = 1500 - PARAM.vmax;
+    int16_t pwm_max = 1500 + PARAM.vmax;
+
+    if (pwm_left < pwm_min)  pwm_left = pwm_min;
+    if (pwm_left > pwm_max)  pwm_left = pwm_max;
+
+    if (pwm_right < pwm_min) pwm_right = pwm_min;
+    if (pwm_right > pwm_max) pwm_right = pwm_max;
+
+    //aplica factor de correccion a un solo motor (asi nunca se sale del tope)
+    if (PARAM.kgiro<1.0f) pwm_left  = 1500 + (int16_t)((pwm_left-1500)*PARAM.kgiro);
+    else                  pwm_right = 1500 + (int16_t)((pwm_right-1500)/PARAM.kgiro);
+
+    SERVO_MICRO(&SERVO1, pwm_left);
+    SERVO_MICRO(&SERVO2, pwm_right);
+}
+
+//=============================================================================
+//             TEST: mueve el robot sin radio para calibrar kgiro y vgiro
+// TRECTO=vel,ms/  TGIRO=dir,ms/  (STOP o el radio lo cortan en cualquier momento)
+//=============================================================================
+#define TEST_VEL_MAX   500     //us respecto al neutro
+#define TEST_MS_MIN    100
+#define TEST_MS_MAX    10000   //si se pierde el enlace, el robot para solo en este tiempo
+#define TEST_RAMPA_MS  200     //arranque suave: un tiron hace patinar y desvia el robot
+
+static int16_t  test_vel=0;
+static int16_t  test_giro=0;
+static uint32_t test_ms=0;
+static uint32_t test_t0=0;
+
+static void Test_inicia(int16_t vel, int16_t giro, uint32_t ms)
+{
+    test_vel=vel;
+    test_giro=giro;
+    test_ms=ms;
+    test_t0=uwTick;
+    estado=test;
+}
+
+//corre en el while mientras estado==test. No bloquea: kgiro y vgiro se pueden cambiar en vivo
+static void Test_tarea(void)
+{
+    uint32_t t=uwTick-test_t0;
+
+    if (t>=test_ms)
+    {
+        estado=stop;
+        SERVO_MILI(&SERVO1,1.5);
+        SERVO_MILI(&SERVO2,1.5);
+        uartx_write_text(&huart1, "TEST: fin\r\n");
+        return;
+    }
+
+    float f=(t<TEST_RAMPA_MS) ? (float)t/TEST_RAMPA_MS : 1.0f;
+    Motores_mueve((int16_t)(test_vel*f), (int16_t)(test_giro*f));
+}
+
+//modo automatico: corre en el while mientras estado==automatico.
+//Por ahora no hace nada: motores en neutro. Aqui se programa la rutina
+static void Control_Automatico(void)
+{
+    SERVO_MILI(&SERVO1,1.5);
+    SERVO_MILI(&SERVO2,1.5);
+}
+
+//busca "clave" en la trama y lee el numero que sigue (ej. "KGIRO=0.95/" -> 0.95)
+static uint8_t lee_num(const char *trama, const char *clave, float *valor)
+{
+    const char *p=strstr(trama,clave);
+    char *fin;
+    if (p==0) return 0;
+    p+=strlen(clave);
+    float v=strtof(p,&fin);
+    if (fin==p) return 0;   //no habia numero
+    *valor=v;
+    return 1;
+}
+
+//lee "clave" seguida de dos enteros separados por coma (ej. "TRECTO=150,2000/")
+static uint8_t lee_dos(const char *trama, const char *clave, long *a, long *b)
+{
+    const char *p=strstr(trama,clave);
+    char *fin;
+    if (p==0) return 0;
+    p+=strlen(clave);
+    *a=strtol(p,&fin,10);
+    if ((fin==p)||(*fin!=',')) return 0;
+    p=fin+1;
+    *b=strtol(p,&fin,10);
+    return (fin==p) ? 0 : 1;
 }
 
 void procesa_rx()
 {
-	char procesa[200];
+	const char *trama=(const char *)UARTRX1.trama_rx;
+	float v;
+	long a,b;
 
-	if (strstr(UARTRX1.trama_rx,"LED1ON")) PIN_ON(LED2);
-	else if (strstr(UARTRX1.trama_rx,"LED1OFF")) PIN_OFF(LED2);
-
-	else if (strstr(UARTRX1.trama_rx,"KGIRO="))
+	//STOP primero: nada puede taparlo
+	if (strstr(trama,"STOP"))  //orden de parada por serial
 	    {
-	        strcpy(procesa, strtok(UARTRX1.trama_rx, "="));  //inicia captura de tokens desde el =
-	        strcpy(procesa, strtok(0, "/"));  //captura hasta el /
-	        //pasa la cadena a  numero
-	        kgiro=atof(procesa);
-
+	        estado=stop;
 	    }
 
-	else if (strstr(UARTRX1.trama_rx,"VGIRO="))
-	    {
-	        strcpy(procesa, strtok(UARTRX1.trama_rx, "="));  //inicia captura de tokens desde el =
-	        strcpy(procesa, strtok(0, "/"));  //captura hasta el /
-	        //pasa la cadena a  numero
-	        vgiro=atoi(procesa);
+	else if (strstr(trama,"LED1ON")) PIN_ON(LED2);
+	else if (strstr(trama,"LED1OFF")) PIN_OFF(LED2);
 
+	else if (lee_num(trama,"KGIRO=",&v))
+	    {
+	        if (!Param_set_kgiro(v)) uartx_write_text(&huart1, "KGIRO: fuera de rango\r\n");
 	    }
 
-	 else if(strstr(UARTRX1.trama_rx, "RUN"))  //orden de inicio por serial
-				 {
-		           estado=run;
-				 }
+	else if (lee_num(trama,"VGIRO=",&v))
+	    {
+	        if (!Param_set_vgiro((int32_t)v)) uartx_write_text(&huart1, "VGIRO: fuera de rango\r\n");
+	    }
 
-	 else if(strstr(UARTRX1.trama_rx, "STOP"))  //orden de inicio por serial
-					 {
-			           estado=stop;
-					 }
+	else if (lee_num(trama,"VMAX=",&v))
+	    {
+	        if (!Param_set_vmax((int32_t)v)) uartx_write_text(&huart1, "VMAX: fuera de rango\r\n");
+	    }
 
+	//---------------- test (solo con el robot parado o en otro test)
+	else if (lee_dos(trama,"TRECTO=",&a,&b))   //velocidad en us, tiempo en ms
+	    {
+	        if (estado==run) uartx_write_text(&huart1, "TEST: manda el radio, suba el canal 3\r\n");
+	        else if ((a<-TEST_VEL_MAX)||(a>TEST_VEL_MAX)||(b<TEST_MS_MIN)||(b>TEST_MS_MAX))
+	            uartx_write_text(&huart1, "TEST: valores invalidos\r\n");
+	        else
+	        {
+	            Test_inicia((int16_t)a,0,(uint32_t)b);
+	            uartx_write_text(&huart1, "TEST: recto\r\n");
+	        }
+	    }
 
+	else if (lee_dos(trama,"TGIRO=",&a,&b))    //direccion (+1 derecha, -1 izquierda), tiempo en ms
+	    {
+	        if (estado==run) uartx_write_text(&huart1, "TEST: manda el radio, suba el canal 3\r\n");
+	        else if (((a!=1)&&(a!=-1))||(b<TEST_MS_MIN)||(b>TEST_MS_MAX))
+	            uartx_write_text(&huart1, "TEST: valores invalidos\r\n");
+	        else
+	        {
+	            Test_inicia(0,(int16_t)(a*500),(uint32_t)b);   //Motores_mueve lo limita a vgiro
+	            uartx_write_text(&huart1, "TEST: giro\r\n");
+	        }
+	    }
+
+	else if (strstr(trama,"AUTO"))   //modo automatico, igual que el test: no le quita el mando al radio
+	    {
+	        if (estado==run) uartx_write_text(&huart1, "AUTO: manda el radio, suba el canal 3\r\n");
+	        else
+	        {
+	            estado=automatico;
+	            uartx_write_text(&huart1, "AUTO: activado\r\n");
+	        }
+	    }
+
+	//---------------- parametros
+	else if (strstr(trama,"GUARDAFLASH"))
+	    {
+	        if (estado!=stop) uartx_write_text(&huart1, "FLASH: detener el robot\r\n");
+	        else uartx_write_text(&huart1, Param_guardar() ? "FLASH: guardado\r\n" : "FLASH: error al guardar\r\n");
+	    }
+
+	else if (strstr(trama,"LEEFLASH"))
+	    {
+	        uartx_write_text(&huart1, Param_leer_flash() ? "FLASH: parametros leidos\r\n" : "FLASH: no hay parametros guardados\r\n");
+	    }
+
+	else if (strstr(trama,"DEFECTO"))   //en RAM; GUARDAFLASH para grabarlos
+	    {
+	        Param_defecto();
+	        uartx_write_text(&huart1, "DEFECTO: aplicado, sin guardar\r\n");
+	    }
+
+	else if (strstr(trama,"RUN"))  //orden de inicio por serial
+	    {
+	        if (ancho3>=RC3_ALTO) uartx_write_text(&huart1, "RUN: canal 3 arriba, no arranca\r\n");
+	        else estado=run;
+	    }
 }
+
+//lidars, radio, bateria, piso y parametros: 5 veces por segundo. imu = lo que se reporta al panel
+//sobre la imu (0 = el panel no espera sus datos). Lleva su propio tiempo: llamarla siempre en el lazo
+static void Manda_lentos(uint8_t imu)
+{
+	static uint32_t t_lento=0;
+
+	if ((uwTick-t_lento)>=200)
+	{
+		uint8_t lidok=0;
+		int n=0;
+
+		t_lento=uwTick;
+		for (uint8_t c=0; c<LIDAR_N; c++)
+		{
+			if (lidar_ok[c]) lidok|=(1u<<c);
+			n+=sprintf(&texto[n],">L%u:%.1f\n",c+1,distancia[c]);
+		}
+		n+=sprintf(&texto[n],">C1:%.0f\n>C2:%.0f\n>C3:%.0f\n>C4:%.0f\n",ancho1,ancho2,ancho3,ancho4);
+		//codigos crudos del ADC (0 a 4095): buffer 0 = bateria, 1 a 4 = sensores de piso
+		n+=sprintf(&texto[n],">BAT:%u\n>S1:%u\n>S2:%u\n>S3:%u\n>S4:%u\n",
+				adc1_codigo[0],adc1_codigo[1],adc1_codigo[2],adc1_codigo[3],adc1_codigo[4]);
+		sprintf(&texto[n],"*KGIRO%.3f**VMAX%ld**VGIRO%ld**EST%u**GUARD%u**IMU%u**LIDOK%u*\n",
+				PARAM.kgiro,(long)PARAM.vmax,(long)PARAM.vgiro,estado,Param_guardado(),imu,lidok);
+		uartx_write_text(&huart1, texto);
+	}
+}
+
+//datos para el panel y para Teleplot (formato ">nombre:valor"). Hay que llamarla siempre en
+//el while: lleva sus propios tiempos para no llenar el serial, que bloquea el lazo al enviar
 void  Manda_basicos()
 {
-	sprintf(texto,"*KGIRO%.1f*",kgiro);
-	uartx_write_text(&huart1, texto);
-	sprintf(texto,"*VGIRO%u*",vgiro);
-   uartx_write_text(&huart1, texto);
+	static uint32_t t_rapido=0;
 
+	//imu: 20 veces por segundo
+	if (imu_ok && ((uwTick-t_rapido)>=50))
+	{
+		t_rapido=uwTick;
+		sprintf(texto,">PITCH:%.1f\n>ROLL:%.1f\n>YAW:%.1f\n>AX:%.2f\n>AY:%.2f\n>AZ:%.2f\n",pitch,roll,yaw,ax,ay,az);
+		uartx_write_text(&huart1, texto);
+	}
 
+	Manda_lentos(imu_ok);
 }
  void LEE_RX()
  {
 	 if (UARTRX1.flag_rx==1)
 	 	  {
 	 	      uartx_write_text(&huart1, UARTRX1.trama_rx);
+	 	      uartx_write_text(&huart1, "\r\n");
 	 	      procesa_rx(); //procedimeinto donde se procesan los datos
 	 		  uartRX_DMA_Re_init(&UARTRX1);
 	 	  }
 
  }
+#if USA_IR
+void lee_ir()
+{
+	uint32_t codigo_ir;
+	if (IR_leer(&codigo_ir))   //1 = llego un codigo (ya queda rearmado)
+	{
+	 PIN_BLINK(LED1);   //LED3 no: lo cambia PWM_IN.c con cada flanco del canal 1
+	 sprintf(texto,"codigo=0x%08lX/\r\n",(unsigned long)codigo_ir);
+	 uartx_write_text(&huart1, texto);
+
+	 if ((codigo_ir==IRSTART)||(codigo_ir==IRSTART2))
+		{
+		 uartx_write_text(&huart1, "START\r\n");
+		 estado=run;
+		}
+	 if ((codigo_ir==IRSTOP)||(codigo_ir==IRSTOP2))
+		{
+		 uartx_write_text(&huart1, "STOP\r\n");
+		 estado=stop;
+		}
+	 if (codigo_ir==IRPROG)  uartx_write_text(&huart1, "PROG1\r\n");
+	 if (codigo_ir==IRPROG2) uartx_write_text(&huart1, "PROG2\r\n");
+	}
+}
+#endif
 void LEE_IMU()
 {
 	 BNO055_ReadEuler();
+	 BNO055_ReadAcceleration();
 
 }
 void Manda_IMU()
@@ -345,37 +614,155 @@ void test_muestreo()
 
 void Control_Sumo()
 {
+    //sin señal en acelerador o giro: motores parados
+    if ((ancho1==0)||(ancho2==0))
+    {
+        SERVO_MILI(&SERVO1,1.5);
+        SERVO_MILI(&SERVO2,1.5);
+        return;
+    }
+
     //leo valores respecto al cero =1500
     int16_t vel  = (int16_t)ancho1 - 1500;   // -500 a +500
     int16_t giro = (int16_t)ancho2 - 1500;   // -500 a +500
 
-    //limito velocidad giro
-  if (giro>vgiro)  giro =vgiro;
-  if (giro<-vgiro)  giro =-vgiro;
+    //mando centrado o transmisor apagado (cerca de 1500): quieto, sin arrastrarse
+    if (abs(vel)<RC_ZONA_MUERTA)  vel=0;
+    if (abs(giro)<RC_ZONA_MUERTA) giro=0;
 
-    // aplica giro
-    int16_t pwm_left  = 1500 + vel + giro;
-    int16_t pwm_right = 1500 + vel - giro;
+    Motores_mueve(vel,giro);
+}
 
-    // Limito a 1000–2000
-    if (pwm_left < 1000)  pwm_left = 1000;
-    if (pwm_left > 2000)  pwm_left = 2000;
+#if PRUEBA_SOLO_RADIO
+static uint8_t prueba_stop=0;   //1 = STOP del panel: reposo hasta subir el canal 3 (y bajarlo para volver)
 
-    if (pwm_right < 1000) pwm_right = 1000;
-    if (pwm_right > 2000) pwm_right = 2000;
+//ordenes de la prueba: STOP y parametros. Lo demas (TRECTO, AUTO...) se ignora y lo avisa
+static void Prueba_procesa_rx(void)
+{
+	const char *trama=(const char *)UARTRX1.trama_rx;
+	float v;
 
+	//STOP primero: nada puede taparlo. El panel lo manda varias veces: avisa solo la primera
+	if (strstr(trama,"STOP"))
+	    {
+	        if (!prueba_stop) uartx_write_text(&huart1, "PRUEBA: STOP, suba y baje el canal 3 para volver\r\n");
+	        prueba_stop=1;
+	    }
 
+	else if (lee_num(trama,"KGIRO=",&v))
+	    {
+	        if (!Param_set_kgiro(v)) uartx_write_text(&huart1, "KGIRO: fuera de rango\r\n");
+	    }
 
+	else if (lee_num(trama,"VGIRO=",&v))
+	    {
+	        if (!Param_set_vgiro((int32_t)v)) uartx_write_text(&huart1, "VGIRO: fuera de rango\r\n");
+	    }
 
-    //NORMALIZO -100 A 100
-    float velnor  = 0.2*pwm_left - 300;
-    //APLICA FACTOR DE CORRECCION
-    velnor=velnor*kgiro;
-    //desnormalizo
-    pwm_left =5.0*velnor + 1500;
+	else if (lee_num(trama,"VMAX=",&v))
+	    {
+	        if (!Param_set_vmax((int32_t)v)) uartx_write_text(&huart1, "VMAX: fuera de rango\r\n");
+	    }
 
-    SERVO_MICRO(&SERVO1, pwm_left);
-    SERVO_MICRO(&SERVO2, pwm_right);
+	else if (strstr(trama,"GUARDAFLASH"))   //grabar frena la cpu: solo con los mandos centrados
+	    {
+	        uint8_t quieto=(estado==stop)||(ancho1==0)||(ancho2==0)||
+	                       ((abs((int16_t)ancho1-1500)<RC_ZONA_MUERTA)&&(abs((int16_t)ancho2-1500)<RC_ZONA_MUERTA));
+
+	        if (!quieto) uartx_write_text(&huart1, "FLASH: pase a reposo o centre los mandos para guardar\r\n");
+	        else uartx_write_text(&huart1, Param_guardar() ? "FLASH: guardado\r\n" : "FLASH: error al guardar\r\n");
+	    }
+
+	else if (strstr(trama,"LEEFLASH"))
+	    {
+	        uartx_write_text(&huart1, Param_leer_flash() ? "FLASH: parametros leidos\r\n" : "FLASH: no hay parametros guardados\r\n");
+	    }
+
+	else if (strstr(trama,"DEFECTO"))   //en RAM; GUARDAFLASH para grabarlos
+	    {
+	        Param_defecto();
+	        uartx_write_text(&huart1, "DEFECTO: aplicado, sin guardar\r\n");
+	    }
+
+	else uartx_write_text(&huart1, "PRUEBA: orden ignorada, solo STOP, KGIRO, VGIRO, VMAX y flash\r\n");
+}
+
+//prueba: lee los canales 1 y 2 y los aplica a los motores. No sale nunca de aqui.
+//canal 3 abajo = control. Arriba, en el medio (transmisor apagado) o sin señal = reposo.
+//sigue la posicion del interruptor: al volver abajo retoma el control, no hay que subirlo y bajarlo.
+//STOP del panel (boton, Esc o espacio) = reposo hasta subir el canal 3; al bajarlo vuelve el control.
+//lee los lidars y manda bateria, lidars y piso; la imu no. Por serial solo atiende STOP, kgiro, vgiro, vmax y la flash.
+//sin señal en el canal 1 o 2, Control_Sumo deja los motores en neutro
+static void Prueba_solo_radio(void)
+{
+	static CANAL_RC rc1,rc2,rc3;
+	uint32_t t=uwTick;
+
+	uartx_write_text(&huart1, "PRUEBA: solo radio, canales 1, 2 y 3\r\n");
+
+	while (1)
+	{
+		if (UARTRX1.flag_rx==1)
+		{
+			uartx_write_text(&huart1, UARTRX1.trama_rx);
+			uartx_write_text(&huart1, "\r\n");
+			Prueba_procesa_rx();
+			uartRX_DMA_Re_init(&UARTRX1);
+		}
+
+		//canales cruzados: ancho1 (velocidad) se lee de la entrada 2, ancho2 (giro) de la entrada 1
+		Lee_canal_RC(&flag_PWM_in2,pulso2,&rc1,&ancho1);
+		Lee_canal_RC(&flag_PWM_in1,pulso1,&rc2,&ancho2);
+		Lee_canal_RC(&flag_PWM_in3,pulso3,&rc3,&ancho3);
+
+		//solo el canal 3 arriba de verdad borra el STOP: un corte de señal o el transmisor apagado no
+		if (ancho3>=RC3_ALTO) prueba_stop=0;
+
+		uint8_t nuevo=((ancho3>0)&&(ancho3<=RC3_BAJO)&&(!prueba_stop)) ? run : stop;
+		if (nuevo!=estado)
+		{
+			estado=nuevo;
+			//queda en el log del panel: si pasa a reposo solo, muestra con que valor del canal 3
+			sprintf(texto,"PRUEBA: %s C3=%.0f\r\n",(estado==run) ? "CONTROL" : "REPOSO",ancho3);
+			uartx_write_text(&huart1, texto);
+		}
+
+		if (estado==run) Control_Sumo();
+		else
+		{
+			SERVO_MILI(&SERVO1,1.5);
+			SERVO_MILI(&SERVO2,1.5);
+		}
+
+		if ((uwTick-t)>=50)
+		{
+			t=uwTick;
+			LEE_LIDARS_FAST();
+
+			//reiniciar un lidar colgado bloquea el lazo: los motores siguen con la ultima orden
+			uint32_t parado=uwTick-t;
+			if (parado>=RC_PERIODO_MAX_MS)
+			{
+				sprintf(texto,"LIDAR: lazo parado %lu ms\r\n",(unsigned long)parado);
+				uartx_write_text(&huart1, texto);
+			}
+		}
+
+		Manda_lentos(0);
+	}
+}
+#endif
+
+//lee lidars e imu 20 veces por segundo
+void Lee_sensores_tarea()
+{
+	static uint32_t t=0;
+
+	if ((uwTick-t)<50) return;
+	t=uwTick;
+
+	LEE_LIDARS_FAST();
+	if (imu_ok) LEE_IMU();
 }
 
 /* USER CODE END 0 */
@@ -423,7 +810,22 @@ int main(void)
   MX_ICACHE_Init();
   MX_TIM15_Init();
   MX_TIM6_Init();
+  MX_TIM7_Init();
   /* USER CODE BEGIN 2 */
+ //INICIA PWM: lo primero, los ESC (bidireccionales) deben ver neutro = 1500us desde el arranque
+ SERVO_init(&SERVO1);
+ SERVO_init(&SERVO2);
+ SERVO_init(&SERVO3);
+ SERVO_init(&SERVO4);
+ SERVO_MILI(&SERVO1,1.5);
+ SERVO_MILI(&SERVO2,1.5);
+ SERVO_MILI(&SERVO3,1.5);
+ SERVO_MILI(&SERVO4,1.5);
+
+ //cargo los parametros guardados en flash (o los de defecto si no hay)
+ if (Param_init()) uartx_write_text(&huart1,"PARAMETROS: flash\r\n");
+ else              uartx_write_text(&huart1,"PARAMETROS: defecto\r\n");
+
  Delay_Init();
  I2C_SCAN(hi2c2);
 HAL_Delay(100);
@@ -441,22 +843,7 @@ Sensores_init();//inia adc DMA
  //si quiero probar tiempo de muestreo
  //test_muestreo();
 
- //HABILITO PUENTE H  DIS=0
- PIN_OFF(PH_EN);
-
- //TEST DIRRECION PH
- PIN_ON(PH1D);
- PIN_ON(PH2D);
-
- //INICIA PWM
- SERVO_init(&SERVO1);
- SERVO_init(&SERVO2);
- SERVO_init(&SERVO3);
- SERVO_init(&SERVO4);
- SERVO_MILI(&SERVO1,1.5);
- SERVO_MILI(&SERVO2,1.5);
- SERVO_MILI(&SERVO3,1.5);
- SERVO_MILI(&SERVO4,1.5);
+ //mas tiempo en neutro para que los ESC se armen antes de aceptar ordenes
  HAL_Delay(1000);
 
 
@@ -471,17 +858,29 @@ Sensores_init();//inia adc DMA
 */
 
   //INICIO IMU
- //BNO055_INIT();
+ //solo si responde: sin sensor, las lecturas no sirven
+ imu_ok=(HAL_I2C_IsDeviceReady(&BNO055_I2C,BNO055_I2C_ADDRESS,2,5)==HAL_OK) ? 1 : 0;
+ if (imu_ok) BNO055_INIT();
+ uartx_write_text(&huart1, imu_ok ? "IMU: OK\r\n" : "IMU: no responde\r\n");
  TICK_RC=uwTick;
 //inicia el muestro
  //HAL_TIM_Base_Start_IT(&htim6);
+#if USA_IR
+//control IR (necesita EXTI6 y TIM7 con sus interrupciones en el .ioc)
+ IR_init();
+ //IR_calibrar(10);   //SOLO para sacar los codigos: imprime 10 y sigue. Luego comentar
+#endif
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
 
-  uint32_t tick_teleplot = uwTick;
+#if PRUEBA_SOLO_RADIO
+  Prueba_solo_radio();
+#endif
 
+  uint32_t tick_teleplot = uwTick;
+/*
   while (1)
   {
    sprintf(texto,">BAT:%u\n",adc1_codigo[0]);
@@ -499,6 +898,10 @@ Sensores_init();//inia adc DMA
 
 
   }
+  */
+  
+  
+  /*
   while (1)
   {
     // Barrido sin esperas; se envia a Teleplot como maximo una vez por periodo de medida.
@@ -508,11 +911,24 @@ Sensores_init();//inia adc DMA
       Manda_Lidars_Teleplot();
       HAL_GPIO_TogglePin(LED1_GPIO_Port, LED1_Pin);
     }
+  }*/
+/*
+  while(1)
+  {
+ LEE_PWM();
+ uartx_write_text(&huart1, "\r\n\r\n");
+ HAL_Delay(1000);
+    
   }
+*/
  while (1)
  {
+#if USA_IR
+	 lee_ir();
+#endif
 	 LEE_RX();
 	 LEE_PWM();
+	 Lee_sensores_tarea();
 	 switch (estado)
 	 {
 	 case stop:
@@ -526,6 +942,18 @@ Sensores_init();//inia adc DMA
 	 case run:
 
 	     	 Control_Sumo();
+   	 		  break;
+
+
+	 case automatico:
+
+		 Control_Automatico();
+		 break;
+
+
+	 case test:
+
+	     	 Test_tarea();
    	 		  break;
 
 
@@ -1165,6 +1593,44 @@ static void MX_TIM6_Init(void)
 }
 
 /**
+  * @brief TIM7 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM7_Init(void)
+{
+
+  /* USER CODE BEGIN TIM7_Init 0 */
+
+  /* USER CODE END TIM7_Init 0 */
+
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM7_Init 1 */
+
+  /* USER CODE END TIM7_Init 1 */
+  htim7.Instance = TIM7;
+  htim7.Init.Prescaler = 250-1;
+  htim7.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim7.Init.Period = 8000;
+  htim7.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+  if (HAL_TIM_Base_Init(&htim7) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim7, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM7_Init 2 */
+
+  /* USER CODE END TIM7_Init 2 */
+
+}
+
+/**
   * @brief TIM8 Initialization Function
   * @param None
   * @retval None
@@ -1178,7 +1644,6 @@ static void MX_TIM8_Init(void)
 
   TIM_ClockConfigTypeDef sClockSourceConfig = {0};
   TIM_MasterConfigTypeDef sMasterConfig = {0};
-  TIM_IC_InitTypeDef sConfigIC = {0};
 
   /* USER CODE BEGIN TIM8_Init 1 */
 
@@ -1199,22 +1664,10 @@ static void MX_TIM8_Init(void)
   {
     Error_Handler();
   }
-  if (HAL_TIM_IC_Init(&htim8) != HAL_OK)
-  {
-    Error_Handler();
-  }
   sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
   sMasterConfig.MasterOutputTrigger2 = TIM_TRGO2_RESET;
   sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
   if (HAL_TIMEx_MasterConfigSynchronization(&htim8, &sMasterConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sConfigIC.ICPolarity = TIM_INPUTCHANNELPOLARITY_RISING;
-  sConfigIC.ICSelection = TIM_ICSELECTION_DIRECTTI;
-  sConfigIC.ICPrescaler = TIM_ICPSC_DIV1;
-  sConfigIC.ICFilter = 0;
-  if (HAL_TIM_IC_ConfigChannel(&htim8, &sConfigIC, TIM_CHANNEL_1) != HAL_OK)
   {
     Error_Handler();
   }
@@ -1425,6 +1878,12 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : IR_in_Pin */
+  GPIO_InitStruct.Pin = IR_in_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(IR_in_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pins : PC8 PC9 */
   GPIO_InitStruct.Pin = GPIO_PIN_8|GPIO_PIN_9;

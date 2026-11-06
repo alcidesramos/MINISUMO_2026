@@ -10,7 +10,8 @@
 #define M_PI 3.14159265358979323846
 
 
-//varibles de acelelacion float ax,ay,az;
+//varibles de acelelacion
+float ax,ay,az;
 
 //aceleraciones lineal
  float alx,aly,alz;
@@ -91,10 +92,11 @@ void BNO055_INIT()
 
 
 // Función para leer aceleraciones en m/s^2
-void BNO055_Read0Acceleration()
+void BNO055_ReadAcceleration()
 {
     uint8_t data[6];
-    HAL_I2C_Mem_Read(&BNO055_I2C, BNO055_I2C_ADDRESS, BNO055_ACC_DATA_X_LSB, I2C_MEMADD_SIZE_8BIT, data, 6, 100);
+    //si falla la lectura conserva los valores anteriores (data quedaria con basura)
+    if (HAL_I2C_Mem_Read(&BNO055_I2C, BNO055_I2C_ADDRESS, BNO055_ACC_DATA_X_LSB, I2C_MEMADD_SIZE_8BIT, data, 6, 100) != HAL_OK) return;
 
     int16_t raw_ax = (int16_t)(data[1] << 8 | data[0]);
     int16_t raw_ay = (int16_t)(data[3] << 8 | data[2]);
@@ -246,7 +248,8 @@ void BNO055_LEE_DATOS_CRUDOS_Prom(int cuantos)
 void BNO055_ReadEuler()
 {
     uint8_t data[6];
-    HAL_I2C_Mem_Read(&BNO055_I2C, BNO055_I2C_ADDRESS, BNO055_EUL_HEADING_LSB, I2C_MEMADD_SIZE_8BIT, data, 6, 100);
+    //si falla la lectura conserva los valores anteriores (data quedaria con basura)
+    if (HAL_I2C_Mem_Read(&BNO055_I2C, BNO055_I2C_ADDRESS, BNO055_EUL_HEADING_LSB, I2C_MEMADD_SIZE_8BIT, data, 6, 100) != HAL_OK) return;
 
     yaw = (float)((int16_t)(data[1] << 8 | data[0])) / 16.0;
     roll = (float)((int16_t)(data[3] << 8 | data[2])) / 16.0;

@@ -15,22 +15,25 @@
 //DEFINE LOS USART  A USAR
 extern UART_HandleTypeDef huart1;
 
-//inciar uart de recepcion por interrupcion  y tamaño del buffer
-UARTRXS UARTRX1 = {&huart1,USART1,100};
+
+//Tamaño del buffer de los puertos deseado
+static uint8_t buffer_rx1[512];
+//variables  puertos uart usado
+//                 huart    instancia  buffer				tamaño
+UARTRXS UARTRX1 = {&huart1, USART1, buffer_rx1, sizeof(buffer_rx1)};
 
 
 
 //*********************************************************
-//se llama solo una vez para  crear el buffer trama rx del usart deseado
+//se llama solo una vez para iniciar la recepcion del usart deseado
 void uartRX_it_idle_dma_init(UARTRXS *SERIAL)
 {
-// Asigna memoria
-SERIAL->trama_rx = malloc(SERIAL->sizeT);  //reserva memoria
- memset(SERIAL->trama_rx,0,SERIAL->sizeT-1);//limpia el  buffer
+ if ((SERIAL->trama_rx == NULL) || (SERIAL->sizeT < 2)) return;   //sin buffer asignado: no inicia
+ memset(SERIAL->trama_rx,0,SERIAL->sizeT);//limpia TODO el buffer
  SERIAL->flag_rx=0;// LIMPIA LA BANDERA
 __HAL_UART_CLEAR_OREFLAG(SERIAL->huart); // Limpia Overrun Error
 __HAL_UART_FLUSH_DRREGISTER(SERIAL->huart); // Limpia buffer de entrada
- HAL_UARTEx_ReceiveToIdle_DMA(SERIAL->huart, (uint8_t*)SERIAL->trama_rx, SERIAL->sizeT);//inica la recepcion por idle
+ HAL_UARTEx_ReceiveToIdle_DMA(SERIAL->huart, (uint8_t*)SERIAL->trama_rx, SERIAL->sizeT-1);//inica la recepcion por idle (sizeT-1: el ultimo byte queda en 0 = fin de texto)
 __HAL_DMA_DISABLE_IT(SERIAL->huart->hdmarx, DMA_IT_HT); // deshabilita HT, deja activo IDLE + buffer lleno
 
 }
@@ -41,12 +44,12 @@ __HAL_DMA_DISABLE_IT(SERIAL->huart->hdmarx, DMA_IT_HT); // deshabilita HT, deja 
 void  uartRX_DMA_Re_init(UARTRXS *SERIAL)
 {
 
-	memset(SERIAL->trama_rx,0,SERIAL->sizeT-1);//limpia el  buffer
+	memset(SERIAL->trama_rx,0,SERIAL->sizeT);//limpia TODO el buffer
 
 	SERIAL->flag_rx=0;// LIMPIA LA BANDERA
 __HAL_UART_CLEAR_OREFLAG(SERIAL->huart); // Limpia Overrun Error
 __HAL_UART_FLUSH_DRREGISTER(SERIAL->huart); // Limpia buffer de entrada
- HAL_UARTEx_ReceiveToIdle_DMA(SERIAL->huart, (uint8_t*)SERIAL->trama_rx, SERIAL->sizeT);//inica la recepcion por idle
+ HAL_UARTEx_ReceiveToIdle_DMA(SERIAL->huart, (uint8_t*)SERIAL->trama_rx, SERIAL->sizeT-1);//inica la recepcion por idle (sizeT-1: el ultimo byte queda en 0 = fin de texto)
 __HAL_DMA_DISABLE_IT(SERIAL->huart->hdmarx, DMA_IT_HT); // deshabilita HT, deja activo IDLE + buffer lleno
 }
 
@@ -83,7 +86,8 @@ void uartRX_INTERRUPT(UART_HandleTypeDef *huart,uint16_t sizex)
 		  if(UARTRX1.flag_rx==0)
 		{
 		HAL_UART_DMAStop(UARTRX1.huart);  //para la recepcion temporarmente
-		HAL_UARTEx_ReceiveToIdle_DMA(UARTRX1.huart, (uint8_t*)UARTRX1.trama_rx, UARTRX1.sizeT);//inica la recepcion por idle
+		memset(UARTRX1.trama_rx,0,UARTRX1.sizeT);//limpia restos del mensaje con error
+		HAL_UARTEx_ReceiveToIdle_DMA(UARTRX1.huart, (uint8_t*)UARTRX1.trama_rx, UARTRX1.sizeT-1);//inica la recepcion por idle (sizeT-1: el ultimo byte queda en 0)
 		__HAL_DMA_DISABLE_IT(UARTRX1.huart->hdmarx, DMA_IT_HT); // deshabilita HT, deja activo IDLE + buffer lleno
 
 		}
@@ -102,7 +106,7 @@ void uartRX_INTERRUPT(UART_HandleTypeDef *huart,uint16_t sizex)
 		__HAL_DMA_DISABLE_IT(UARTRX2.huart->hdmarx, DMA_IT_HT); // deshabilita HT, deja activo IDLE + buffer lleno
 
 		}
-	  } 
+	  }
 */
 
  }

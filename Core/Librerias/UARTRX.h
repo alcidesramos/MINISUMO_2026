@@ -12,17 +12,20 @@
 
 
 typedef struct {
+    //los 4 primeros se cargan al definir:  {&huart1, USART1, buffer, sizeof(buffer)}
     UART_HandleTypeDef *huart;
-    USART_TypeDef *usart_instance;  // Agregar este campo
-    uint16_t sizeT;
+    USART_TypeDef *usart_instance;
+    uint8_t *trama_rx;           //buffer de recepcion
+	uint16_t sizeT;
+
+
     volatile uint32_t *DR;
     volatile uint32_t *SR;
     volatile uint32_t *RDR;
     volatile uint32_t *ICR;
-    char flag_rx;
+    volatile char flag_rx;       //volatile: la escribe la interrupcion y la lee el main
 	uint16_t dato;
-	uint16_t num_datos;
-	uint8_t *trama_rx;
+	volatile uint16_t num_datos; //volatile: la escribe la interrupcion y la lee el main
 } UARTRXS;
 
 
@@ -36,14 +39,20 @@ extern UARTRXS   UARTRX7;
 extern UARTRXS   UARTRX8;
 extern UARTRXS   UARTNEXTION;
 extern UARTRXS   GPS_UARTRX;
+extern UARTRXS   MQTT_UARTRX;
 
 //definir en el  UART1RX1.c los uart a usar
 /*
  //DEFINE LOS USART  A USAR
  extern UART_HandleTypeDef huart1;
 
-//inciar uart de recepcion por interrupcion  y tamaño del buffer
-UARTRXS UARTRX1 = {&huart1,USART1,100};
+//buffer de recepcion estatico e inicio del uart (tamaño = sizeof del buffer)
+static uint8_t buffer_rx1[512];
+UARTRXS UARTRX1 = {&huart1, USART1, buffer_rx1, sizeof(buffer_rx1)};
+
+//si usa otro usart, otro buffer:
+static uint8_t buffer_rx2[256];
+UARTRXS UARTRX2 = {&huart2, USART2, buffer_rx2, sizeof(buffer_rx2)};
 
 //en el procedimiento de interrupcion uartRX_INTERRUPT
 
@@ -130,5 +139,5 @@ void uartRX_it_idle_dma_init(UARTRXS *SERIAL);
 void uartRX_DMA_Re_init(UARTRXS *SERIAL);
 void uartRX_INTERRUPT(UART_HandleTypeDef *huart,uint16_t sizex);
 void uartRX_Errores(UART_HandleTypeDef *huart);
- 
+
 #endif /* LIBRERIAS_UARTRX_H_ */

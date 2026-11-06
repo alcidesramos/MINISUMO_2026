@@ -95,8 +95,8 @@ void Error_Handler(void);
 #define PIXEL_GPIO_Port GPIOB
 #define PH_EN_Pin GPIO_PIN_15
 #define PH_EN_GPIO_Port GPIOB
-#define IR_REC_Pin GPIO_PIN_6
-#define IR_REC_GPIO_Port GPIOC
+#define IR_in_Pin GPIO_PIN_6
+#define IR_in_GPIO_Port GPIOC
 #define IR2_Pin GPIO_PIN_7
 #define IR2_GPIO_Port GPIOC
 #define SD_SW_Pin GPIO_PIN_8
